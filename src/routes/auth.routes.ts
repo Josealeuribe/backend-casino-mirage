@@ -1,0 +1,447 @@
+import { Router } from "express";
+import bcrypt from "bcryptjs";
+import { z } from "zod";
+import { Prisma } from "@prisma/client";
+import { asyncHandler } from "../utils/asyncHandler.js";
+import { prisma } from "../lib/prisma.js";
+import { signSessionToken, verifyPrizeTicket } from "../utils/jwt.js";
+import { generarCodigoCanje } from "../utils/codigoCanje.js";
+import { requireAuth } from "../middleware/requireAuth.js";
+import { marcarFueraDeLinea, registrarPresencia } from "../middleware/presencia.js";
+import { estadoDeBloqueo, limpiarFallos, registrarFallo } from "../utils/intentosLogin.js";
+
+export const authRouter = Router();
+
+// NOTA DE ALCANCE: no hay recuperacion de contrasena por correo (no hay
+// proveedor de email configurado para Arauca). Un cliente que la olvide debe
+// pedirle al administrador que se la restablezca -- el mismo mecanismo que ya
+// existe para el personal (ver admin.routes.ts /usuarios/:id/restablecer-password).
+
+const passwordSchema = z
+  .string()
+  .min(8, "Mínimo 8 caracteres.")
+  .regex(/[A-Z]/, "Debe incluir una mayúscula.")
+  .regex(/[0-9]/, "Debe incluir un número.");
+
+// Chequeo de disponibilidad en tiempo real: el frontend lo llama con debounce
+// mientras el usuario escribe su correo o documento.
+authRouter.get(
+  "/disponibilidad",
+  asyncHandler(async (req, res) => {
+    const email = typeof req.query.email === "string" ? req.query.email.trim().toLowerCase() : undefined;
+    const docNum = typeof req.query.docNum === "string" ? req.query.docNum.trim() : undefined;
+
+    if (!email && !docNum) {
+      return res.status(400).json({ error: "Debes enviar email o docNum." });
+    }
+
+    const result: { emailDisponible?: boolean; docNumDisponible?: boolean } = {};
+
+    if (email) {
+      const existente = await prisma.cliente.findUnique({ where: { email } });
+      result.emailDisponible = !existente;
+    }
+    if (docNum) {
+      const existente = await prisma.cliente.findUnique({ where: { docNumero: docNum } });
+      result.docNumDisponible = !existente;
+    }
+
+    return res.json(result);
+  }),
+);
+
+const registerSchema = z
+  .object({
+    nombres: z.string().trim().min(1, "Nombres requeridos."),
+    apellidos: z.string().trim().min(1, "Apellidos requeridos."),
+    docType: z.enum(["Cédula de Ciudadanía", "Pasaporte", "Tarjeta de Extranjería"]),
+    docNum: z.string().trim().min(3, "Número de documento inválido."),
+    birth: z.string().refine((v) => !Number.isNaN(Date.parse(v)), "Fecha de nacimiento inválida."),
+    phone: z.string().trim().min(7, "Número de celular inválido."),
+    dept: z.string().trim().min(1, "Departamento requerido."),
+    city: z.string().trim().min(1, "Ciudad requerida."),
+    email: z.string().trim().toLowerCase().email("Correo inválido."),
+    pass: passwordSchema,
+    passConfirm: z.string(),
+    terminos: z.literal(true, { errorMap: () => ({ message: "Debes aceptar los términos." }) }),
+    datos: z.literal(true, { errorMap: () => ({ message: "Debes autorizar el tratamiento de datos." }) }),
+    edad: z.literal(true, { errorMap: () => ({ message: "Debes confirmar que eres mayor de edad." }) }),
+    promo: z.literal(true, { errorMap: () => ({ message: "Debes aceptar las condiciones de la promoción." }) }),
+    comms: z.boolean().default(false),
+    ticket: z.string().optional(),
+  })
+  .refine((data) => data.pass === data.passConfirm, {
+    message: "Las contraseñas no coinciden.",
+    path: ["passConfirm"],
+  });
+
+function toSafeCliente(cliente: {
+  id: number;
+  nombres: string;
+  apellidos: string;
+  email: string;
+  docNumero: string;
+  telefono: string;
+  departamento: string;
+  ciudad: string;
+}) {
+  return {
+    id: cliente.id,
+    nombres: cliente.nombres,
+    apellidos: cliente.apellidos,
+    email: cliente.email,
+    docNumero: cliente.docNumero,
+    telefono: cliente.telefono,
+    departamento: cliente.departamento,
+    ciudad: cliente.ciudad,
+  };
+}
+
+function toSafeStaff(usuario: {
+  id: number;
+  nombre: string;
+  email: string;
+  rol: string;
+  debeCambiarPassword: boolean;
+  sede?: { clave: string; nombre: string; direccion: string } | null;
+}) {
+  return {
+    id: usuario.id,
+    nombre: usuario.nombre,
+    email: usuario.email,
+    rol: usuario.rol,
+    sede: usuario.sede ?? null,
+    debeCambiarPassword: usuario.debeCambiarPassword,
+  };
+}
+
+const STAFF_INCLUDE = { sede: { select: { clave: true, nombre: true, direccion: true } } } as const;
+
+function toEstadoParticipacion(bono: { estado: string } | null) {
+  if (!bono) return { yaParticipo: false, bonoCanjeado: false };
+  return { yaParticipo: true, bonoCanjeado: bono.estado === "reclamado" };
+}
+
+function toSafeBono(
+  bono:
+    | {
+        codigo: string;
+        estado: string;
+        creadoEn: Date;
+        canjeadoEn: Date | null;
+        vigenciaHasta: Date;
+        sedeCanjeada: { nombre: string; direccion: string } | null;
+        canjeadoPor: { nombre: string } | null;
+        premio: { clave: string; nombre: string; detalle: string; monto: number };
+      }
+    | null,
+) {
+  if (!bono) return null;
+  return {
+    codigo: bono.codigo,
+    estado: bono.estado,
+    creadoEn: bono.creadoEn,
+    canjeadoEn: bono.canjeadoEn,
+    vigenciaHasta: bono.vigenciaHasta,
+    premio: bono.premio,
+    // Dónde se redimió: el casino de quien lo entregó. En Arauca cualquier
+    // sede puede entregar cualquier premio, asi que no hay "sede a la que
+    // debia ir" -- solo la sede real de entrega.
+    sede: bono.sedeCanjeada?.nombre ?? null,
+    canjeadoPor: bono.canjeadoPor?.nombre ?? null,
+  };
+}
+
+const BONO_INCLUDE = {
+  premio: { select: { clave: true, nombre: true, detalle: true, monto: true } },
+  sedeCanjeada: { select: { nombre: true, direccion: true } },
+  canjeadoPor: { select: { nombre: true } },
+} as const;
+
+authRouter.post(
+  "/register",
+  asyncHandler(async (req, res) => {
+    const parsed = registerSchema.safeParse(req.body);
+    if (!parsed.success) {
+      return res.status(400).json({ error: parsed.error.issues[0]?.message ?? "Datos inválidos." });
+    }
+    const data = parsed.data;
+
+    const nacimiento = new Date(data.birth);
+    const edadAnios = Math.floor((Date.now() - nacimiento.getTime()) / (365.25 * 24 * 60 * 60 * 1000));
+    if (edadAnios < 18) {
+      return res.status(400).json({ error: "Debes ser mayor de 18 años para registrarte." });
+    }
+
+    // El departamento y la ciudad se validan contra la tabla de ubicaciones.
+    // El formulario ya los pinta como <select> (no admite texto libre), pero
+    // la validacion vive aqui de todas formas: el frontend se puede saltar,
+    // la API no.
+    const municipio = await prisma.municipio.findFirst({
+      where: { nombre: data.city, departamento: { nombre: data.dept, activo: true } },
+      select: { id: true },
+    });
+    if (!municipio) {
+      return res.status(400).json({ error: "El departamento o la ciudad seleccionados no son válidos." });
+    }
+
+    const existente = await prisma.cliente.findFirst({
+      where: { OR: [{ email: data.email }, { docNumero: data.docNum }] },
+    });
+    if (existente) {
+      return res.status(409).json({ error: "Ya existe una cuenta con ese correo o documento." });
+    }
+
+    const passwordHash = await bcrypt.hash(data.pass, 10);
+
+    let premioTicket: { clave: string } | null = null;
+    let bonoError: string | null = null;
+    if (data.ticket) {
+      try {
+        const payload = verifyPrizeTicket(data.ticket);
+        premioTicket = { clave: payload.premioClave };
+      } catch {
+        bonoError = "Tu premio ya no está disponible (el tiempo para reclamarlo expiró).";
+      }
+    }
+
+    const premio = premioTicket ? await prisma.premio.findUnique({ where: { clave: premioTicket.clave } }) : null;
+    if (premioTicket && (!premio || !premio.activo)) {
+      bonoError = "Tu premio ya no está disponible.";
+    }
+
+    try {
+      const resultado = await prisma.$transaction(
+        async (tx) => {
+          const cliente = await tx.cliente.create({
+            data: {
+              nombres: data.nombres,
+              apellidos: data.apellidos,
+              docTipo: data.docType,
+              docNumero: data.docNum,
+              nacimiento,
+              telefono: data.phone,
+              departamento: data.dept,
+              ciudad: data.city,
+              email: data.email,
+              passwordHash,
+            },
+          });
+
+          await tx.consentimiento.createMany({
+            data: [
+              { clienteId: cliente.id, tipo: "terminos", aceptado: data.terminos },
+              { clienteId: cliente.id, tipo: "datos", aceptado: data.datos },
+              { clienteId: cliente.id, tipo: "edad", aceptado: data.edad },
+              { clienteId: cliente.id, tipo: "promo", aceptado: data.promo },
+              { clienteId: cliente.id, tipo: "comms", aceptado: data.comms },
+            ],
+          });
+
+          let bono = null;
+          if (premio && premio.activo) {
+            for (let intento = 0; intento < 5 && !bono; intento++) {
+              try {
+                bono = await tx.bonoGanado.create({
+                  data: {
+                    clienteId: cliente.id,
+                    premioId: premio.id,
+                    codigo: generarCodigoCanje(),
+                    vigenciaHasta: premio.vigenciaHasta,
+                  },
+                  include: BONO_INCLUDE,
+                });
+              } catch (error) {
+                const esColisionDeCodigo =
+                  error instanceof Prisma.PrismaClientKnownRequestError &&
+                  error.code === "P2002" &&
+                  (error.meta?.target as string[] | undefined)?.includes("codigo");
+                if (!esColisionDeCodigo || intento === 4) throw error;
+              }
+            }
+          }
+
+          return { cliente, bono };
+        },
+        { timeout: 20_000, maxWait: 10_000 },
+      );
+
+      const token = signSessionToken({ tipo: "cliente", clienteId: resultado.cliente.id, email: resultado.cliente.email });
+
+      return res.status(201).json({
+        token,
+        tipo: "cliente",
+        cliente: toSafeCliente(resultado.cliente),
+        bono: toSafeBono(resultado.bono),
+        ...toEstadoParticipacion(resultado.bono),
+        bonoError,
+      });
+    } catch (error) {
+      console.error("Error creando cliente:", error);
+      return res.status(500).json({ error: "No se pudo crear la cuenta. Intenta de nuevo." });
+    }
+  }),
+);
+
+const loginSchema = z.object({
+  identifier: z.string().trim().min(1, "Ingresa tu correo o documento."),
+  password: z.string().min(1, "Ingresa tu contraseña."),
+});
+
+authRouter.post(
+  "/login",
+  asyncHandler(async (req, res) => {
+    const parsed = loginSchema.safeParse(req.body);
+    if (!parsed.success) {
+      return res.status(400).json({ error: parsed.error.issues[0]?.message ?? "Datos inválidos." });
+    }
+    const { identifier, password } = parsed.data;
+
+    const bloqueo = await estadoDeBloqueo(identifier);
+    if (bloqueo.bloqueado) {
+      const minutos = Math.ceil(bloqueo.segundosRestantes / 60);
+      return res.status(429).json({
+        error: `Demasiados intentos fallidos. Vuelve a intentarlo en ${minutos} ${minutos === 1 ? "minuto" : "minutos"}.`,
+        segundosRestantes: bloqueo.segundosRestantes,
+      });
+    }
+
+    const rechazar = async () => {
+      const { restantes } = await registrarFallo(req, identifier);
+      return res.status(401).json({ error: "Credenciales inválidas.", intentosRestantes: restantes });
+    };
+
+    const staff = await prisma.usuario.findUnique({
+      where: { email: identifier.toLowerCase() },
+      include: STAFF_INCLUDE,
+    });
+    if (staff) {
+      if (!staff.activo) {
+        return res.status(401).json({ error: "Esta cuenta está deshabilitada." });
+      }
+      const passwordValida = await bcrypt.compare(password, staff.passwordHash);
+      if (!passwordValida) return rechazar();
+      await limpiarFallos(identifier);
+      const token = signSessionToken({
+        tipo: "staff",
+        usuarioId: staff.id,
+        email: staff.email,
+        rol: staff.rol as "admin" | "cajero",
+      });
+      return res.json({ token, tipo: "staff", staff: toSafeStaff(staff) });
+    }
+
+    const cliente = await prisma.cliente.findFirst({
+      where: { OR: [{ email: identifier.toLowerCase() }, { docNumero: identifier }] },
+    });
+    if (!cliente) return rechazar();
+
+    const passwordValida = await bcrypt.compare(password, cliente.passwordHash);
+    if (!passwordValida) return rechazar();
+    await limpiarFallos(identifier);
+
+    const bono = await prisma.bonoGanado.findUnique({ where: { clienteId: cliente.id }, include: BONO_INCLUDE });
+    const token = signSessionToken({ tipo: "cliente", clienteId: cliente.id, email: cliente.email });
+
+    return res.json({
+      token,
+      tipo: "cliente",
+      cliente: toSafeCliente(cliente),
+      bono: toSafeBono(bono),
+      ...toEstadoParticipacion(bono),
+    });
+  }),
+);
+
+const cambiarPasswordSchema = z
+  .object({
+    actual: z.string().min(1, "Ingresa tu contraseña actual."),
+    nueva: passwordSchema,
+    confirmar: z.string(),
+  })
+  .refine((data) => data.nueva === data.confirmar, { message: "Las contraseñas no coinciden.", path: ["confirmar"] })
+  .refine((data) => data.nueva !== data.actual, {
+    message: "La nueva contraseña debe ser distinta de la actual.",
+    path: ["nueva"],
+  });
+
+authRouter.post(
+  "/cambiar-password",
+  requireAuth,
+  asyncHandler(async (req, res) => {
+    const parsed = cambiarPasswordSchema.safeParse(req.body);
+    if (!parsed.success) {
+      return res.status(400).json({ error: parsed.error.issues[0]?.message ?? "Datos inválidos." });
+    }
+    const { actual, nueva } = parsed.data;
+    const sesion = req.session!;
+
+    if (sesion.tipo === "staff") {
+      const usuario = await prisma.usuario.findUnique({ where: { id: sesion.usuarioId } });
+      if (!usuario) return res.status(404).json({ error: "Usuario no encontrado." });
+      if (!(await bcrypt.compare(actual, usuario.passwordHash))) {
+        return res.status(401).json({ error: "La contraseña actual no es correcta." });
+      }
+      await prisma.usuario.update({
+        where: { id: usuario.id },
+        data: { passwordHash: await bcrypt.hash(nueva, 10), debeCambiarPassword: false },
+      });
+      await limpiarFallos(usuario.email);
+      return res.json({ ok: true });
+    }
+
+    const cliente = await prisma.cliente.findUnique({ where: { id: sesion.clienteId } });
+    if (!cliente) return res.status(404).json({ error: "Cliente no encontrado." });
+    if (!(await bcrypt.compare(actual, cliente.passwordHash))) {
+      return res.status(401).json({ error: "La contraseña actual no es correcta." });
+    }
+    await prisma.cliente.update({ where: { id: cliente.id }, data: { passwordHash: await bcrypt.hash(nueva, 10) } });
+    await limpiarFallos(cliente.email);
+    await limpiarFallos(cliente.docNumero);
+    return res.json({ ok: true });
+  }),
+);
+
+authRouter.post(
+  "/actividad",
+  requireAuth,
+  registrarPresencia,
+  asyncHandler(async (_req, res) => {
+    return res.json({ ok: true });
+  }),
+);
+
+authRouter.post(
+  "/salir",
+  requireAuth,
+  asyncHandler(async (req, res) => {
+    if (req.session?.tipo === "staff") {
+      await marcarFueraDeLinea(req.session.usuarioId);
+    }
+    return res.json({ ok: true });
+  }),
+);
+
+authRouter.get(
+  "/me",
+  requireAuth,
+  asyncHandler(async (req, res) => {
+    if (req.session?.tipo === "staff") {
+      const staff = await prisma.usuario.findUnique({ where: { id: req.session.usuarioId }, include: STAFF_INCLUDE });
+      if (!staff) return res.status(404).json({ error: "Usuario no encontrado." });
+      return res.json({ tipo: "staff", staff: toSafeStaff(staff) });
+    }
+
+    const clienteId = req.session?.tipo === "cliente" ? req.session.clienteId : undefined;
+    const cliente = await prisma.cliente.findUnique({ where: { id: clienteId } });
+    if (!cliente) return res.status(404).json({ error: "Cliente no encontrado." });
+    const bono = await prisma.bonoGanado.findUnique({ where: { clienteId: cliente.id }, include: BONO_INCLUDE });
+
+    return res.json({
+      tipo: "cliente",
+      cliente: toSafeCliente(cliente),
+      bono: toSafeBono(bono),
+      ...toEstadoParticipacion(bono),
+    });
+  }),
+);

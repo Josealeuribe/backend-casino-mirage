@@ -1,0 +1,249 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "mysql"
+  url      = env("DATABASE_URL")
+}
+
+// Cliente registrado. Un cliente solo puede tener un BonoGanado en toda
+// su vida (ver restriccion @unique en BonoGanado.clienteId) -- es la regla
+// de negocio "un jugador no puede ganar mas de un bono".
+//
+// `departamento`/`ciudad` son texto (no llaves foraneas a Departamento/
+// Municipio) a proposito, igual que en Casino-cucuta: el registro valida el
+// par contra esas tablas al crear la cuenta, pero una vez guardado el nombre
+// queda fijo aunque el catalogo de ubicaciones cambie despues.
+model Cliente {
+  id           Int      @id @default(autoincrement())
+  nombres      String
+  apellidos    String
+  docTipo      String
+  docNumero    String   @unique
+  nacimiento   DateTime
+  telefono     String
+  departamento String
+  ciudad       String
+  email        String   @unique
+  passwordHash String
+  createdAt    DateTime @default(now())
+
+  consentimientos Consentimiento[]
+  bono            BonoGanado?
+
+  @@map("clientes")
+}
+
+// Division politica usada por el formulario de registro (selects, no texto
+// libre). Vive en base para poder VALIDAR el par departamento/ciudad al
+// registrarse, no solo para pintar los <select> -- antes de esto el backend
+// aceptaba cualquier texto en el campo "ciudad".
+model Departamento {
+  id     Int     @id @default(autoincrement())
+  nombre String  @unique
+  // Arauca (y sus vecinos: Casanare, Boyaca, Norte de Santander, Vichada)
+  // van primero -- son los que de verdad importan para este publico.
+  orden  Int     @default(0)
+  activo Boolean @default(true)
+
+  municipios Municipio[]
+
+  @@map("departamentos")
+}
+
+model Municipio {
+  id             Int          @id @default(autoincrement())
+  nombre         String
+  departamentoId Int
+  departamento   Departamento @relation(fields: [departamentoId], references: [id], onDelete: Cascade)
+  orden          Int          @default(0)
+
+  // Un mismo nombre de municipio puede repetirse entre departamentos, pero
+  // no dos veces dentro del mismo.
+  @@unique([departamentoId, nombre])
+  @@index([departamentoId])
+  @@map("municipios")
+}
+
+// Registro auditable de cada aceptacion legal del formulario de registro
+// (terminos, tratamiento de datos, mayoria de edad, condiciones de la
+// promocion, comunicaciones opcionales). Queda fecha y version del texto
+// aceptado por si el texto legal cambia en el futuro.
+model Consentimiento {
+  id         Int      @id @default(autoincrement())
+  clienteId  Int
+  cliente    Cliente  @relation(fields: [clienteId], references: [id], onDelete: Cascade)
+  tipo       String
+  aceptado   Boolean
+  version    String   @default("v1")
+  aceptadoEn DateTime @default(now())
+
+  @@index([clienteId])
+  @@map("consentimientos")
+}
+
+// Visitante sin cuenta que gira la ruleta. Existe para poder limitar los
+// giros: el endpoint es anonimo, asi que sin esto no hay forma de saber que
+// dos giros vienen de la misma persona.
+//
+// El id viaja en una cookie httpOnly Y en un token firmado (X-Visitante),
+// igual que en Casino-cucuta: la cookie sola falla en movil cuando front y
+// API quedan en origenes distintos (ver utils/visitante.ts).
+model VisitanteAnonimo {
+  id         String   @id
+  giros      Int      @default(0)
+  primerGiro DateTime @default(now())
+  ultimoGiro DateTime @updatedAt
+  ip         String?
+
+  @@index([ip])
+  @@map("visitantes_anonimos")
+}
+
+// Un renglon por cada giro anonimo exitoso (no por visitante, por giro). Solo
+// existe para poder graficar "giros por dia" en el Dashboard del admin con
+// datos reales: VisitanteAnonimo guarda un contador acumulado por persona,
+// pero no CUANDO ocurrio cada giro. Tabla deliberadamente minima -- de solo
+// anexar, sin relaciones -- porque lo unico que hace falta es contar por
+// fecha.
+model GiroEvento {
+  id       Int      @id @default(autoincrement())
+  creadoEn DateTime @default(now())
+
+  @@index([creadoEn])
+  @@map("giros_eventos")
+}
+
+// Intentos fallidos de inicio de sesion, para frenar la fuerza bruta.
+// Se lleva en base y no en memoria para que sobreviva a reinicios del
+// contenedor.
+model IntentoLogin {
+  id             String    @id
+  fallos         Int       @default(0)
+  ultimoFallo    DateTime  @updatedAt
+  bloqueadoHasta DateTime?
+  ultimaIp       String?
+
+  @@index([bloqueadoHasta])
+  @@map("intentos_login")
+}
+
+// Las 2 sedes fisicas de Arauca. Vive en base y no en codigo para que el
+// select del cajero y la asignacion de premios salgan de la misma fuente.
+model Sede {
+  id        Int     @id @default(autoincrement())
+  clave     String  @unique
+  nombre    String
+  direccion String
+  activo    Boolean @default(true)
+  orden     Int     @default(0)
+
+  canjes   BonoGanado[]
+  usuarios Usuario[]
+
+  @@map("sedes")
+}
+
+// Catalogo administrable de premios de la ruleta "Gira y Gana". `clave` es
+// el identificador estable que el frontend usa para mapear cada premio a su
+// icono/color (esos datos visuales siguen viviendo en
+// src/features/landing/data/prizes.ts, no se duplican aqui).
+model Premio {
+  id        Int     @id @default(autoincrement())
+  clave     String  @unique
+  nombre    String
+  detalle   String  @db.Text
+  monto     Int
+  weight    Int
+  activo    Boolean @default(true)
+
+  // Hasta cuando se puede redimir un bono de este premio. Cada bono se lleva
+  // una copia al crearse (BonoGanado.vigenciaHasta) para que extender la
+  // promocion no cambie lo que ya se le prometio a alguien.
+  vigenciaHasta DateTime
+
+  bonos           BonoGanado[]
+  cambiosVigencia CambioVigencia[]
+
+  @@map("premios")
+}
+
+// Registro de cada vez que se mueve la vigencia de un premio. Libro de
+// solo-anexar: nunca se edita ni se borra una fila.
+model CambioVigencia {
+  id       Int    @id @default(autoincrement())
+  premioId Int
+  premio   Premio @relation(fields: [premioId], references: [id], onDelete: Cascade)
+
+  anterior DateTime
+  nueva    DateTime
+  motivo   String   @db.Text
+
+  bonosAfectados Int    @default(0)
+  registradoPor  String
+
+  creadoEn DateTime @default(now())
+
+  @@index([premioId, creadoEn])
+  @@map("cambios_vigencia")
+}
+
+// El bono que un cliente gano al girar la ruleta y reclamo al registrarse.
+// clienteId es @unique: la base de datos, no solo el frontend, impide que un
+// mismo jugador acumule mas de un bono.
+model BonoGanado {
+  id            Int       @id @default(autoincrement())
+  clienteId     Int       @unique
+  cliente       Cliente   @relation(fields: [clienteId], references: [id], onDelete: Cascade)
+  premioId      Int
+  premio        Premio    @relation(fields: [premioId], references: [id])
+  codigo        String    @unique
+  estado        String    @default("pendiente") // pendiente | reclamado
+  creadoEn      DateTime  @default(now())
+  vigenciaHasta DateTime
+  canjeadoEn    DateTime?
+  canjeadoPorId Int?
+  canjeadoPor   Usuario?  @relation(fields: [canjeadoPorId], references: [id])
+
+  // Sede donde el cajero entrego fisicamente el bono. Como en Arauca ningun
+  // premio esta atado a una sede fija (se redime en cualquiera de las dos),
+  // esta columna es la unica que dice donde se entrego de verdad.
+  sedeCanjeId  Int?
+  sedeCanjeada Sede? @relation(fields: [sedeCanjeId], references: [id])
+
+  @@map("bonos_ganados")
+}
+
+// Cuentas de personal interno (no clientes). Entran por el mismo login del
+// navbar; el rol decide a que panel se les redirige tras autenticarse. No
+// hay auto-registro: se siembran directamente (ver prisma/seed.ts).
+model Usuario {
+  id           Int      @id @default(autoincrement())
+  nombre       String
+  email        String   @unique
+  passwordHash String
+  rol          String // 'admin' | 'cajero'
+  activo       Boolean  @default(true)
+  createdAt    DateTime @default(now())
+
+  // El personal no recupera contrasena por correo (no hay proveedor de email
+  // configurado): el admin le genera una clave temporal desde su panel y
+  // este flag obliga a cambiarla en el siguiente ingreso.
+  debeCambiarPassword Boolean @default(false)
+
+  // Casino donde trabaja. Nullable porque el admin no pertenece a una sede
+  // concreta.
+  sedeId Int?
+  sede   Sede? @relation(fields: [sedeId], references: [id])
+
+  // Presencia deducida de la ultima senal de vida, no un booleano -- ver
+  // middleware/presencia.ts para el porque.
+  ultimaActividad DateTime?
+  sesionCerradaEn DateTime?
+
+  canjes BonoGanado[]
+
+  @@index([sedeId])
+  @@map("usuarios")
+}
