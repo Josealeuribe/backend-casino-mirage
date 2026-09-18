@@ -8,37 +8,47 @@ const prisma = new PrismaClient();
 // frontend/src/shared/data/sedes.ts, la unica fuente de verdad visual. Si esa
 // lista cambia, esta debe cambiar con ella.
 const SEDES = [
-  { clave: "mirage-3", nombre: "Centro Club Mirage 3", direccion: "Cra. 22 #21-7", orden: 0 },
+  { clave: "mirage-3", nombre: "Centro Club Mirage 3", direccion: "Cra. 22 #21-07", orden: 0 },
   { clave: "mirage-2", nombre: "Centro Club Mirage No. 2", direccion: "Cra. 22 #20-49", orden: 1 },
 ];
 
 // Los 3 bonos de la promocion -- mismos datos y pesos que
 // frontend/src/features/landing/data/prizes.ts. `clave` enlaza cada fila con
 // el icono/color que sigue viviendo en el frontend.
-const UN_ANIO_MS = 365 * 24 * 60 * 60 * 1000;
-const vigenciaHasta = new Date(Date.now() + UN_ANIO_MS);
+//
+// Fecha limite real de la promocion: 30 de septiembre de 2026 (fin del dia,
+// hora Colombia = UTC-5 todo el año, sin horario de verano). Fija a
+// proposito, no "hoy + 1 año" -- un bono creado hoy y otro creado la semana
+// que viene deben vencer el mismo dia, no ir corriendo la fecha cada vez que
+// se siembra la base.
+const vigenciaHasta = new Date("2026-09-30T23:59:59-05:00");
 
+// Reparto pedido explicitamente: el bono de $50.000 le toca a 1 de cada 10
+// personas (10%); el otro 90% se reparte por igual entre $10.000 y $20.000
+// (45% cada uno). weightedRandomIndex normaliza por la suma de los pesos, asi
+// que lo que importa es la PROPORCION entre ellos, no que sumen 100 -- se
+// eligio 100 solo porque hace el porcentaje de cada uno obvio a simple vista.
 const PREMIOS = [
   {
     clave: "bono-10000",
     nombre: "Bono de $10.000",
     detalle: "Redimible únicamente en nuestras sedes físicas de Arauca, presentando tu documento en caja.",
     monto: 10000,
-    weight: 55,
+    weight: 45,
   },
   {
     clave: "bono-20000",
     nombre: "Bono de $20.000",
     detalle: "Redimible únicamente en nuestras sedes físicas de Arauca, presentando tu documento en caja.",
     monto: 20000,
-    weight: 32,
+    weight: 45,
   },
   {
     clave: "bono-50000",
     nombre: "Bono de $50.000",
     detalle: "Nuestro bono de bienvenida mayor, redimible únicamente en nuestras sedes físicas de Arauca.",
     monto: 50000,
-    weight: 13,
+    weight: 10,
   },
 ];
 
@@ -78,7 +88,10 @@ async function main() {
   for (const premio of PREMIOS) {
     await prisma.premio.upsert({
       where: { clave: premio.clave },
-      update: { nombre: premio.nombre, detalle: premio.detalle, monto: premio.monto, weight: premio.weight },
+      // vigenciaHasta va tambien en el update (no solo en el create): sin
+      // esto, volver a correr el seed despues de cambiar la fecha limite
+      // aqui arriba no la aplicaria a los premios que ya existen en base.
+      update: { nombre: premio.nombre, detalle: premio.detalle, monto: premio.monto, weight: premio.weight, vigenciaHasta },
       create: { ...premio, vigenciaHasta },
     });
   }

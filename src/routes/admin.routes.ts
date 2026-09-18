@@ -21,7 +21,10 @@ adminRouter.get(
       prisma.bonoGanado.groupBy({ by: ["estado"], _count: true }),
       prisma.sede.findMany({ where: { activo: true }, orderBy: { orden: "asc" } }),
       prisma.bonoGanado.groupBy({ by: ["premioId"], _count: true }),
-      prisma.bonoGanado.groupBy({ by: ["sedeCanjeId"], where: { estado: "reclamado" }, _count: true }),
+      // Por SEDE ASIGNADA (reparto equitativo al ganar el bono), no por sede
+      // de canje: esto es lo que hay que ver parejo entre las dos sedes
+      // desde el momento en que se otorga el bono, se haya redimido o no.
+      prisma.bonoGanado.groupBy({ by: ["sedeAsignadaId"], _count: true }),
       prisma.cliente.findMany({
         orderBy: { createdAt: "desc" },
         take: 8,
@@ -53,7 +56,7 @@ adminRouter.get(
       },
       valorTotalEntregado: valorTotalCanjeado.reduce((sum, b) => sum + b.premio.monto, 0),
       repartoPorCasino: sedes.map((s) => {
-        const count = porSede.find((r) => r.sedeCanjeId === s.id)?._count ?? 0;
+        const count = porSede.find((r) => r.sedeAsignadaId === s.id)?._count ?? 0;
         return { sede: s.nombre, count, pct: totalRepartoSede > 0 ? Math.round((count / totalRepartoSede) * 100) : 0 };
       }),
       bonosPorPremio: porPremio.map((r) => ({
@@ -138,7 +141,15 @@ adminRouter.get(
   asyncHandler(async (_req, res) => {
     const clientes = await prisma.cliente.findMany({
       orderBy: { createdAt: "desc" },
-      include: { bono: { include: { premio: { select: { nombre: true, monto: true } }, sedeCanjeada: { select: { nombre: true } } } } },
+      include: {
+        bono: {
+          include: {
+            premio: { select: { nombre: true, monto: true } },
+            sedeAsignada: { select: { nombre: true } },
+            sedeCanjeada: { select: { nombre: true } },
+          },
+        },
+      },
     });
 
     return res.json({
@@ -160,6 +171,7 @@ adminRouter.get(
               estado: c.bono.estado,
               creadoEn: c.bono.creadoEn,
               canjeadoEn: c.bono.canjeadoEn,
+              sedeAsignada: c.bono.sedeAsignada.nombre,
               sede: c.bono.sedeCanjeada?.nombre ?? null,
               premio: { nombre: c.bono.premio.nombre, monto: c.bono.premio.monto },
             }
@@ -206,8 +218,14 @@ adminRouter.get(
   }),
 );
 
+// El formulario manda un <input type="date"> -- una fecha pelada
+// "2026-12-31", sin hora. Se exige ese formato exacto (no cualquier string
+// parseable) para poder anexarle la hora de fin del dia en Colombia
+// nosotros mismos, en vez de dejar que `new Date("2026-12-31")` la
+// interprete como medianoche UTC (ver el comentario junto a `nueva` mas
+// abajo, donde se arma la fecha real).
 const vigenciaSchema = z.object({
-  nueva: z.string().refine((v) => !Number.isNaN(Date.parse(v)), "Fecha inválida."),
+  nueva: z.string().regex(/^\d{4}-\d{2}-\d{2}$/, "Fecha inválida."),
   motivo: z.string().trim().min(3, "Indica un motivo."),
 });
 
@@ -225,7 +243,11 @@ adminRouter.post(
     const premio = await prisma.premio.findUnique({ where: { id } });
     if (!premio) return res.status(404).json({ error: "Premio no encontrado." });
 
-    const nueva = new Date(parsed.data.nueva);
+    // Fin del dia en Colombia (UTC-5, sin horario de verano), no medianoche
+    // UTC: `new Date("2026-12-31")` a secas interpretaria esa fecha como
+    // 2026-12-31T00:00:00Z, que en Colombia ya es la noche del 30 -- el
+    // admin pierde casi un dia entero de vigencia sin darse cuenta.
+    const nueva = new Date(`${parsed.data.nueva}T23:59:59-05:00`);
     const sesion = req.session!;
     const registradoPor = sesion.tipo === "staff" ? sesion.email : "desconocido";
 
@@ -390,6 +412,7 @@ adminRouter.get(
         include: {
           premio: { select: { nombre: true, monto: true } },
           cliente: true,
+          sedeAsignada: { select: { nombre: true } },
           sedeCanjeada: { select: { nombre: true } },
           canjeadoPor: { select: { nombre: true, email: true } },
         },
@@ -409,6 +432,7 @@ adminRouter.get(
         codigo: bono.codigo,
         creadoEn: bono.creadoEn,
         canjeadoEn: bono.canjeadoEn,
+        sedeAsignada: bono.sedeAsignada.nombre,
         sede: bono.sedeCanjeada?.nombre ?? null,
         canjeadoPor: bono.canjeadoPor?.nombre ?? null,
         canjeadoPorEmail: bono.canjeadoPor?.email ?? null,

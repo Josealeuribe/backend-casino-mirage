@@ -15,6 +15,7 @@ function buscarPorCodigo(codigo: string) {
     include: {
       premio: { select: { nombre: true, detalle: true, monto: true } },
       cliente: true,
+      sedeAsignada: { select: { id: true, nombre: true, direccion: true } },
       sedeCanjeada: { select: { nombre: true } },
       canjeadoPor: { select: { nombre: true } },
     },
@@ -41,6 +42,10 @@ function toCanjePreview(bono: NonNullable<Awaited<ReturnType<typeof buscarPorCod
       ciudad: bono.cliente.ciudad,
       registradoEn: bono.cliente.createdAt,
     },
+    // Sede a la que este bono quedo asignado desde que se gano (reparto
+    // equitativo) -- el cajero necesita verla ANTES de confirmar, porque
+    // canjear.ts rechaza el intento si no coincide con la suya.
+    sedeAsignada: { nombre: bono.sedeAsignada.nombre, direccion: bono.sedeAsignada.direccion },
     sedeCanje: bono.sedeCanjeada?.nombre ?? null,
     canjeadoPor: bono.canjeadoPor?.nombre ?? null,
   };
@@ -86,6 +91,7 @@ cajeroRouter.get(
         bono: {
           include: {
             premio: { select: { nombre: true, detalle: true, monto: true } },
+            sedeAsignada: { select: { nombre: true, direccion: true } },
             sedeCanjeada: { select: { nombre: true } },
             canjeadoPor: { select: { nombre: true } },
           },
@@ -118,6 +124,7 @@ cajeroRouter.get(
             vigenciaHasta: cliente.bono.vigenciaHasta,
             vencido: cliente.bono.vigenciaHasta.getTime() < Date.now(),
             canjeadoPor: cliente.bono.canjeadoPor?.nombre ?? null,
+            sedeAsignada: { nombre: cliente.bono.sedeAsignada.nombre, direccion: cliente.bono.sedeAsignada.direccion },
             sede: cliente.bono.sedeCanjeada?.nombre ?? null,
             premio: { nombre: cliente.bono.premio.nombre, detalle: cliente.bono.premio.detalle, monto: cliente.bono.premio.monto },
           }
@@ -139,9 +146,12 @@ cajeroRouter.get(
 );
 
 // Confirma el canje. Unica operacion que cambia el estado del bono a
-// 'reclamado'. A diferencia de Casino-cucuta, en Arauca ningun premio esta
-// atado a una sede: cualquiera de las dos puede entregar cualquier premio, asi
-// que no hace falta validar "sede correcta" antes de canjear.
+// 'reclamado'. Desde el reparto equitativo de sedes, cada bono SI esta atado
+// a una sede fija desde que se gano (sedeAsignadaId) -- un cajero solo puede
+// entregar los bonos asignados a su propia sede. El admin (sedeId null,
+// "todas las sedes" segun ya establece CajeroLayout) es la unica excepcion:
+// puede confirmar cualquiera, para no bloquear una gestion administrativa
+// legitima.
 cajeroRouter.post(
   "/codigo/:codigo/canjear",
   asyncHandler(async (req, res) => {
@@ -162,6 +172,11 @@ cajeroRouter.post(
     if (existente.vigenciaHasta.getTime() < Date.now()) {
       const vence = existente.vigenciaHasta.toLocaleDateString("es-CO", { day: "2-digit", month: "long", year: "numeric" });
       return res.status(410).json({ error: `Este bono venció el ${vence} y ya no puede redimirse.` });
+    }
+    if (operador?.sedeId && operador.sedeId !== existente.sedeAsignada.id) {
+      return res.status(409).json({
+        error: `Este bono está asignado a ${existente.sedeAsignada.nombre}. Solo se puede redimir en esa sede.`,
+      });
     }
 
     const resultado = await prisma.bonoGanado.updateMany({

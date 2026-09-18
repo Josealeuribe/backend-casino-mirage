@@ -28,6 +28,22 @@ ruletaRouter.get(
   }),
 );
 
+// Catalogo publico de bonos con su vigencia individual -- a diferencia de
+// /vigencia (que solo da la fecha mas proxima, para el aviso corto), esta
+// ruta lista los 3 premios activos completos porque cada uno puede tener su
+// propia fecha limite (un admin puede extender uno sin tocar los otros).
+ruletaRouter.get(
+  "/premios",
+  asyncHandler(async (_req, res) => {
+    const premios = await prisma.premio.findMany({
+      where: { activo: true },
+      orderBy: { monto: "asc" },
+      select: { clave: true, nombre: true, detalle: true, monto: true, vigenciaHasta: true },
+    });
+    return res.json({ premios });
+  }),
+);
+
 ruletaRouter.get(
   "/giros-restantes",
   asyncHandler(async (req, res) => {

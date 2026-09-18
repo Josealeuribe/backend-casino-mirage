@@ -1,0 +1,91 @@
+# Landing de Arauca + API real (Express/Prisma) + MySQL LOCAL -- este archivo
+# es para DESARROLLO. Por eso `db` no esta detras de un profile y las
+# migraciones corren solas al levantar `api` (ver backend/docker-entrypoint.sh).
+#
+# Para produccion real, con MySQL gestionado en Aiven en vez de este `db`
+# local, ver docker-compose.prod.yml (archivo aparte, no un overlay de este).
+#
+# Uso:
+#   docker compose up -d --build
+#   curl http://127.0.0.1:8002/
+#   curl http://127.0.0.1:4002/api/health
+#
+# Sembrar el catalogo inicial (sedes, premios, admin) la primera vez:
+#   docker compose exec api npm run prisma:seed
+
+name: casino-arauca
+
+services:
+  web:
+    build:
+      context: ./frontend
+      args:
+        # Vacio = base '/' (sirve en la raiz de su propio dominio/pruebas
+        # locales). En innovaclub.com.co va montada bajo /arauca -- ver
+        # innovaclub-infra/nginx/innovaclub.com.co.conf.
+        #
+        # OJO: el guion es simple (${VAR-default}), no doble (${VAR:-default}
+        # a proposito). Con doble guion, un FIGMA_PUBLIC_URL="" explicito (el
+        # que hace falta para probar en local, en la raiz) se trataria igual
+        # que "no seteado" y caeria en /arauca de todas formas. Con guion
+        # simple, un vacio explicito SI se respeta -- solo cae al default
+        # cuando la variable no existe en absoluto.
+        FIGMA_PUBLIC_URL: ${FIGMA_PUBLIC_URL-/arauca}
+        VITE_API_URL: ${VITE_API_URL-/api}
+    restart: unless-stopped
+    ports:
+      - "${WEB_BIND:-127.0.0.1}:${WEB_PORT:-8002}:80"
+    depends_on:
+      - api
+    networks:
+      - casino
+
+  api:
+    build:
+      context: ./backend
+    restart: unless-stopped
+    env_file:
+      - path: ./backend/.env
+        required: false
+    environment:
+      NODE_ENV: production
+      PORT: 4000
+      DATABASE_URL: mysql://${MYSQL_USER:-app_user}:${MYSQL_PASSWORD:-app_pass}@db:3306/${MYSQL_DATABASE:-casino_arauca}
+      CORS_ORIGIN: ${CORS_ORIGIN:-http://localhost:8002}
+    ports:
+      # Atado a loopback: el front la alcanza por la red interna de Docker
+      # (nginx.conf de ./frontend hace proxy_pass hacia http://api:4000). Este
+      # puerto en el host es solo para curl/Postman durante el desarrollo.
+      - "${API_BIND:-127.0.0.1}:${API_PORT:-4002}:4000"
+    depends_on:
+      db:
+        condition: service_healthy
+    networks:
+      - casino
+
+  db:
+    image: mysql:8.4
+    restart: unless-stopped
+    environment:
+      MYSQL_ROOT_PASSWORD: ${MYSQL_ROOT_PASSWORD:-root}
+      MYSQL_DATABASE: ${MYSQL_DATABASE:-casino_arauca}
+      MYSQL_USER: ${MYSQL_USER:-app_user}
+      MYSQL_PASSWORD: ${MYSQL_PASSWORD:-app_pass}
+    ports:
+      - "127.0.0.1:${DB_PORT:-3308}:3306"
+    volumes:
+      - db_data:/var/lib/mysql
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "127.0.0.1", "-p${MYSQL_ROOT_PASSWORD:-root}"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+    networks:
+      - casino
+
+volumes:
+  db_data:
+
+networks:
+  casino:
+    driver: bridge

@@ -1,10 +1,14 @@
 #!/bin/sh
 # Arranque de la API dentro del contenedor.
 #
-# A diferencia de Casino-cucuta (donde el DATABASE_URL de por defecto apunta a
-# produccion y migrar automaticamente seria peligroso), aqui la base ES local
-# y de desarrollo, asi que las migraciones SI corren por defecto -- de lo
-# contrario habria que migrar a mano cada vez que alguien clona el proyecto.
+# Con docker-compose.yml (desarrollo) la base ES local, asi que las
+# migraciones SI corren por defecto -- de lo contrario habria que migrar a
+# mano cada vez que alguien clona el proyecto.
+#
+# Con docker-compose.prod.yml (Aiven, produccion real) RUN_MIGRATIONS viene
+# en "false": ahi migrar solo automaticamente si seria peligroso, igual que
+# en Casino-cucuta -- se corre a mano y a proposito cuando se decide (ver la
+# nota de ese archivo).
 set -e
 
 if [ "${RUN_MIGRATIONS:-true}" = "true" ]; then

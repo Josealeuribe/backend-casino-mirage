@@ -6,6 +6,7 @@ import { asyncHandler } from "../utils/asyncHandler.js";
 import { prisma } from "../lib/prisma.js";
 import { signSessionToken, verifyPrizeTicket } from "../utils/jwt.js";
 import { generarCodigoCanje } from "../utils/codigoCanje.js";
+import { elegirSedeEquitativa } from "../utils/asignarSede.js";
 import { requireAuth } from "../middleware/requireAuth.js";
 import { marcarFueraDeLinea, registrarPresencia } from "../middleware/presencia.js";
 import { estadoDeBloqueo, limpiarFallos, registrarFallo } from "../utils/intentosLogin.js";
@@ -130,6 +131,7 @@ function toSafeBono(
         creadoEn: Date;
         canjeadoEn: Date | null;
         vigenciaHasta: Date;
+        sedeAsignada: { nombre: string; direccion: string };
         sedeCanjeada: { nombre: string; direccion: string } | null;
         canjeadoPor: { nombre: string } | null;
         premio: { clave: string; nombre: string; detalle: string; monto: number };
@@ -144,9 +146,13 @@ function toSafeBono(
     canjeadoEn: bono.canjeadoEn,
     vigenciaHasta: bono.vigenciaHasta,
     premio: bono.premio,
-    // Dónde se redimió: el casino de quien lo entregó. En Arauca cualquier
-    // sede puede entregar cualquier premio, asi que no hay "sede a la que
-    // debia ir" -- solo la sede real de entrega.
+    // Sede asignada AUTOMATICAMENTE al ganar el bono (reparto equitativo,
+    // ver utils/asignarSede.ts) -- es donde el cliente DEBE presentarse,
+    // exista o no ya un canje. Nunca es null: todo bono tiene una desde que
+    // se crea.
+    sedeAsignada: bono.sedeAsignada,
+    // Dónde se redimió DE VERDAD (solo una vez que estado es "reclamado").
+    // En el flujo normal coincide con sedeAsignada.
     sede: bono.sedeCanjeada?.nombre ?? null,
     canjeadoPor: bono.canjeadoPor?.nombre ?? null,
   };
@@ -154,6 +160,7 @@ function toSafeBono(
 
 const BONO_INCLUDE = {
   premio: { select: { clave: true, nombre: true, detalle: true, monto: true } },
+  sedeAsignada: { select: { nombre: true, direccion: true } },
   sedeCanjeada: { select: { nombre: true, direccion: true } },
   canjeadoPor: { select: { nombre: true } },
 } as const;
@@ -240,6 +247,11 @@ authRouter.post(
 
           let bono = null;
           if (premio && premio.activo) {
+            // Se calcula UNA sola vez por fuera del bucle de reintentos: el
+            // reintento existe solo para el choque (muy improbable) de
+            // `codigo`, no tiene sentido volver a sortear la sede en cada
+            // intento del mismo bono.
+            const sedeAsignadaId = await elegirSedeEquitativa(tx);
             for (let intento = 0; intento < 5 && !bono; intento++) {
               try {
                 bono = await tx.bonoGanado.create({
@@ -248,6 +260,7 @@ authRouter.post(
                     premioId: premio.id,
                     codigo: generarCodigoCanje(),
                     vigenciaHasta: premio.vigenciaHasta,
+                    sedeAsignadaId,
                   },
                   include: BONO_INCLUDE,
                 });

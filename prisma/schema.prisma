@@ -139,8 +139,15 @@ model Sede {
   activo    Boolean @default(true)
   orden     Int     @default(0)
 
-  canjes   BonoGanado[]
-  usuarios Usuario[]
+  // Bonos que le tocaron a esta sede en el reparto equitativo (ver
+  // utils/asignarSede.ts) -- es donde el cliente DEBE presentarse, se haya
+  // redimido ya o no. `bonosCanjeados` es un registro aparte: donde se
+  // redimio DE VERDAD, que en circunstancias normales es la misma sede pero
+  // se guarda separado para no perder el historial real si alguna vez hay
+  // una excepcion administrativa.
+  bonosAsignados BonoGanado[] @relation("BonoSedeAsignada")
+  bonosCanjeados BonoGanado[] @relation("BonoSedeCanje")
+  usuarios       Usuario[]
 
   @@map("sedes")
 }
@@ -206,11 +213,20 @@ model BonoGanado {
   canjeadoPorId Int?
   canjeadoPor   Usuario?  @relation(fields: [canjeadoPorId], references: [id])
 
-  // Sede donde el cajero entrego fisicamente el bono. Como en Arauca ningun
-  // premio esta atado a una sede fija (se redime en cualquiera de las dos),
-  // esta columna es la unica que dice donde se entrego de verdad.
+  // Sede asignada AUTOMATICAMENTE al momento de ganar el bono, mediante un
+  // reparto equitativo entre las sedes activas (ver utils/asignarSede.ts) --
+  // es la sede donde el cliente DEBE presentarse a redimirlo, no una entre
+  // varias posibles. El cajero valida esto antes de entregar el premio (ver
+  // POST /cajero/codigo/:codigo/canjear).
+  sedeAsignadaId Int
+  sedeAsignada   Sede @relation("BonoSedeAsignada", fields: [sedeAsignadaId], references: [id])
+
+  // Sede donde el cajero entrego fisicamente el bono -- se llena solo al
+  // canjear. En el flujo normal coincide con sedeAsignadaId, pero se deja
+  // como columna aparte para no perder el historial real de entrega si
+  // alguna vez hay una excepcion administrativa.
   sedeCanjeId  Int?
-  sedeCanjeada Sede? @relation(fields: [sedeCanjeId], references: [id])
+  sedeCanjeada Sede? @relation("BonoSedeCanje", fields: [sedeCanjeId], references: [id])
 
   @@map("bonos_ganados")
 }
